@@ -85,6 +85,18 @@ import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { NativeToolView } from "@oh-my-pi/pi-tui/tools/renderer";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
+import type {
+	ExtensionJudge,
+	ExtensionJudgeAction,
+	ExtensionJudgment,
+	ExtensionJudgmentOptions,
+} from "../../session/extension-judgment";
+export type {
+	ExtensionJudge,
+	ExtensionJudgeAction,
+	ExtensionJudgment,
+	ExtensionJudgmentOptions,
+} from "../../session/extension-judgment";
 import type { EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessagePayload } from "../../session/messages";
@@ -726,6 +738,14 @@ export interface ExtensionContext {
 	 * Optional for compatibility with hosts that do not provide side turns.
 	 */
 	runEphemeralTurn?(options: EphemeralTurnOptions): Promise<EphemeralTurnResult>;
+	/**
+	 * Native-only judgment bound to this extension's owning session. Present only
+	 * while a live extension invocation scope owns this context — a runner-less
+	 * context or a saved context outside a known live scope exposes `undefined`
+	 * rather than a judgment routed by, or billed to, another session. The
+	 * owning extension path comes from the invocation, never from the request.
+	 */
+	judge?: ExtensionJudge;
 	/** Structured memory runtime for status/search/save across the configured backend. */
 	memory?: MemoryRuntimeContext;
 	/** `/annotate` as an API: build or collect annotation feedback on text and diffs. */
@@ -2151,6 +2171,12 @@ export interface ExtensionContextActions {
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
 	runEphemeralTurn?: (options: EphemeralTurnOptions) => Promise<EphemeralTurnResult>;
+	/**
+	 * Session-bound native judgment for the calling extension. The first
+	 * argument is the host-owned extension path from the live invocation scope;
+	 * a host without a supported binding omits this action.
+	 */
+	judge?: ExtensionJudgeAction;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */

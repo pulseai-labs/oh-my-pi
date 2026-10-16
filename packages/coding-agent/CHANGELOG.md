@@ -437,6 +437,8 @@
 ### Added
 
 - Added opt-in native-only typed judgments with successful selected-route and cache evidence, without changing existing callers' fallback behavior.
+- Added the session-bound `ctx.judge` extension bridge: a fixed-role, native-only judgment owned by the calling session, with an immutable request, one total deadline, namespaced purpose/request-id correlation, and opaque failure. Distinct from the already-public `/judgment` runner, which composes without session identity.
+- Added `runEphemeralTurn({ isolated: true })` for evidence-only payload rendering: the side turn sends only the supplied frozen prompt under a fixed renderer system block, without the session transcript, system prompt or tool catalog.
 
 ## [18.8.9] - 2026-10-10
 

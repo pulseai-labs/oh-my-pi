@@ -131,6 +131,7 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 				context,
 				signal,
 				onUpdate,
+				extensionPath: this.registeredTool.extensionPath,
 			}),
 		);
 	}
