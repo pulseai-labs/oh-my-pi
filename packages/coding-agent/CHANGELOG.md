@@ -434,6 +434,9 @@
 - Fixed `grep` hiding matches that appeared beyond the first 512 bytes of a long line.
 - Fixed snapcompaction leaving too little context room after compaction.
 - Fixed usage-limited account pools redeeming saved resets for accounts outside the configured pool.
+### Added
+
+- Added opt-in native-only typed judgments with successful selected-route and cache evidence, without changing existing callers' fallback behavior.
 
 ## [18.8.9] - 2026-10-10
 

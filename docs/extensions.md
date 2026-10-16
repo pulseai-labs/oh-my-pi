@@ -286,6 +286,38 @@ Also exposed:
 - `pi.typebox` (legacy TypeBox-compatible shim)
 - `pi.pi` (package exports)
 
+### Typed judgment runner
+
+The public `@oh-my-pi/pi-coding-agent/judgment` subpath exports `resolveJudge`,
+`ChainJudge`, `JudgeDeps`, `JudgmentRoute`, `JudgmentCache`, and
+`journalJudgmentUsage`. This runner is separate from the extension context:
+`ctx.judge` is not available in this runtime. Session-bound context wiring is a
+separate integration; importing the runner does not supply it.
+
+Runner owners supply their effective settings, model registry, and accounting
+dependencies. Existing callers retain their default local/chat/native chain
+behavior. Opt in with `nativeOnly: true` to filter **every** nonnative candidate
+by API kind before credential lookup or backend construction, including chat
+candidates preceding a native candidate. This mode never appends a session-model
+fallback; when no native candidate is eligible, the judgment rejects. Native
+candidate fallback and account-rejection cooldown remain in effect. Custom
+provider names are supported when their model API is native.
+
+`onResult(route)` observes each successful native wrapper, including cache-only
+results. `route.selected` contains the successful candidate's `api`, `provider`,
+and `model`; the returned `JudgmentResult.model` remains the backend response
+model and can differ. `primaryModel()` is a prediction for pricing, not evidence
+that a candidate served a request. `questions` counts the requested questions;
+`cachedQuestions` counts those answered from cache, distinguishing fresh,
+partial-cache, and full-cache results. Failed wrappers do not emit `onResult`.
+
+This observation callback does not bill usage. Keep session accounting on the
+existing `onUsage`/`journalJudgmentUsage` path exactly once; do not additionally
+bill the returned result. Fully cached calls have no billed usage callback.
+Reports describe wrapper/candidate outcomes, not individual internal HTTP
+retries; a failed wrapper's zero known tokens do not establish zero provider
+cost. Neither a cache hit nor fixture transport proves fresh live inference.
+
 ### Runtime setting overrides
 
 Settings are addressed through typed registry handles (see "Definitions" in [config-usage.md](./config-usage.md#definitions-srcconfigregistryts)); the string-path `settings.get`/`set`/`override` methods were removed in 18.3. Extensions resolve a handle by id with `lookup(id)` (and enumerate them with `all()`) from the `@oh-my-pi/pi-coding-agent/config/registry` subpath, then pass `pi.pi.settings` as the scope:

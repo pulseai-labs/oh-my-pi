@@ -73,11 +73,21 @@ export interface JudgmentUsage {
 	errorMessage?: string;
 }
 
+/** Successful native wrapper route, including answers served from the cache. */
+export type JudgmentRoute = {
+	/** Actual successful candidate, not a prediction or the backend response model. */
+	selected: { api: string; provider: string; model: string };
+	questions: number;
+	cachedQuestions: number;
+};
+
 export interface JudgeDeps {
 	settings: Settings;
 	registry: ModelRegistry;
 	/** The session's active model, appended when the judge role does not already route to it. */
 	sessionModel?: Model;
+	/** Exclude every prompted candidate before construction; never append the session model. */
+	nativeOnly?: true;
 	sessionId?: string;
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
 	/** Why the judgment runs (`find`, `ttsr`, `judge_batch`, …); labels ledger entries and telemetry spans. */
@@ -87,6 +97,8 @@ export interface JudgeDeps {
 	 * hits never. Wire {@link journalJudgmentUsage} here to bill the session.
 	 */
 	onUsage?: (usage: JudgmentUsage) => void;
+	/** Observe successful native wrappers, cache hits included; does not account usage. */
+	onResult?: (route: JudgmentRoute) => void;
 	/** Host telemetry; every attempt, cache hits included, emits one `judgment` span. */
 	telemetry?: AgentTelemetryConfig;
 	/** Answer cache for native judgments; omitted runs every question against the provider. */
@@ -413,6 +425,13 @@ export class ChainJudge implements Judge {
 		const { startedAt, responseModel, questions, cachedQuestions, ...rest } = attempt;
 		const usage: JudgmentUsage = { purpose: this.#deps.purpose, ...rest };
 		if (questions === undefined || cachedQuestions !== questions) this.#deps.onUsage?.(usage);
+		if (attempt.stopReason === "stop" && questions !== undefined && cachedQuestions !== undefined) {
+			this.#deps.onResult?.({
+				selected: { api: attempt.api, provider: attempt.provider, model: attempt.model },
+				questions,
+				cachedQuestions,
+			});
+		}
 		recordJudgmentTelemetry(this.#telemetry, {
 			provider: usage.provider,
 			model: usage.model,
@@ -435,9 +454,16 @@ export class ChainJudge implements Judge {
 	#resolveCandidates(images: readonly ImageContent[] = []): RoleChainCandidate[] {
 		const { settings, registry, sessionModel } = this.#deps;
 		const { roleChain, list: chain } = cachedJudgeRoleChain(settings, registry);
-		if (images.length > 0) return withSessionFallback(imageJudgeRoleChain(roleChain, images), sessionModel, true);
+		if (images.length > 0) {
+			const imageChain = imageJudgeRoleChain(roleChain, images);
+			return this.#deps.nativeOnly
+				? imageChain.filter(candidate => kindOf(candidate) === "native")
+				: withSessionFallback(imageChain, sessionModel, true);
+		}
 		if (chain === this.#candidates?.chain) return this.#candidates.list;
-		const list = withSessionFallback(chain, sessionModel);
+		const list = this.#deps.nativeOnly
+			? chain.filter(candidate => kindOf(candidate) === "native")
+			: withSessionFallback(chain, sessionModel);
 		this.#candidates = { chain, list };
 		return list;
 	}
