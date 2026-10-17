@@ -20,7 +20,7 @@
 
 ### Fixed
 
-- Fixed DeepSeek thinking-mode requests over `anthropic-messages` failing with "The reasoning_content in the thinking mode must be passed back to the API" when a replayed assistant turn carried no reasoning; such a turn now leads with a minimal non-empty thinking block, and every other model's request is unchanged ([#3](https://github.com/pulseai-labs/oh-my-pi/pull/3))
+- Fixed DeepSeek thinking-mode requests over `anthropic-messages` on lanes that replay unsigned thinking failing with "The reasoning_content in the thinking mode must be passed back to the API" when a replayed assistant turn carried no reasoning; such a turn now leads with a minimal non-empty thinking block, and every other model's request is unchanged ([#3](https://github.com/pulseai-labs/oh-my-pi/pull/3) by [@draco28](https://github.com/draco28))
 - Fixed Ollama and Ollama Cloud streaming errors being silently accepted as successful responses ([#16039](https://github.com/can1357/oh-my-pi/pull/16039) by [@mottopanikeiku](https://github.com/mottopanikeiku))
 - Fixed the hermes in-band scanner exposing a truncated tool name for streaming tool calls: `toolStart` now waits for the complete JSON name, so a stream that splits or stops mid-name never reports a partial tool name ([#16064](https://github.com/can1357/oh-my-pi/pull/16064) by [@adi-IL](https://github.com/adi-IL))
 - Fixed `keys.peek()` rotating through stored accounts on each call; it now returns the first account whose token has not expired, every time, so model discovery keeps reading one account's cached catalog ([#16061](https://github.com/can1357/oh-my-pi/pull/16061) by [@gchai](https://github.com/gchai))

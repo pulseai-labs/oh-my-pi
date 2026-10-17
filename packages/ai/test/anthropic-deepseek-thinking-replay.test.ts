@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { convertAnthropicMessages, streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type {
 	AssistantMessage,
 	Message,
@@ -9,6 +9,7 @@ import type {
 	UserMessage,
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 /**
@@ -55,6 +56,16 @@ function makeCustomAnthropicModel(): Model<"anthropic-messages"> {
 		contextWindow: 200_000,
 		reasoning: true,
 	} as ModelSpec<"anthropic-messages">);
+}
+
+/**
+ * A DeepSeek-class lane that FORWARDS to signature-enforcing Anthropic:
+ * `signingEndpoint: true`, `replayUnsignedThinking: false`. An unsigned
+ * `{ signature: "" }` thinking block 400s here ("Invalid signature in
+ * thinking"), and a signed empty one must survive untouched.
+ */
+function makeSigningDeepseekModel(): Model<"anthropic-messages"> {
+	return getBundledModel("cloudflare-ai-gateway", "deepseek/deepseek-v4-pro") as Model<"anthropic-messages">;
 }
 
 function makeUser(text: string): UserMessage {
@@ -130,6 +141,9 @@ async function capturePayload(
 			apiKey: "sk-ant-api-test",
 			signal: AbortSignal.abort(),
 			thinkingEnabled,
+			// Pin the cache policy: without it `PI_CACHE_RETENTION` in the ambient
+			// environment would change the byte fixtures below.
+			cacheRetention: "short",
 			onPayload: payload => resolve(payload),
 		},
 	);
@@ -150,7 +164,9 @@ function unthoughtToolCallHistory(model: Model<"anthropic-messages">): Message[]
 /**
  * Whole-request pins captured before the fix on the same build. The change is
  * gated on the DeepSeek model class, so a Claude or custom anthropic-messages
- * request has to serialize exactly as it did before.
+ * request has to serialize exactly as it did before. The literal couples to
+ * bundled catalog data (`max_tokens`, the model's thinking mode), so a
+ * `models.json` change for these two models is expected to move it.
  */
 const CLAUDE_REQUEST_FIXTURE = `{"model":"claude-opus-4-6","messages":[{"role":"user","content":"go"},{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"x"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"ok"}],"is_error":false,"cache_control":{"type":"ephemeral"}}]},{"role":"user","content":[{"type":"text","text":"next","cache_control":{"type":"ephemeral"}}]}],"max_tokens":128000,"thinking":{"type":"adaptive"},"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]},"stream":true}`;
 const CUSTOM_REQUEST_FIXTURE = `{"model":"reasoning-model","messages":[{"role":"user","content":"go"},{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"x"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"ok","is_error":false,"cache_control":{"type":"ephemeral"}}]},{"role":"user","content":[{"type":"text","text":"next","cache_control":{"type":"ephemeral"}}]}],"max_tokens":8192,"thinking":{"type":"enabled","budget_tokens":1024,"display":"summarized"},"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]},"stream":true}`;
@@ -162,9 +178,9 @@ describe("DeepSeek thinking-mode replay over anthropic-messages", () => {
 		const blocks = assistantBlocks(payload);
 		expect(blocks[0]?.type).toBe("thinking");
 		expect((blocks[0] as WireThinkingBlock).thinking.length).toBeGreaterThan(0);
-		// The tool_use that the turn exists for must survive behind it.
-		expect(blocks.some(block => block.type === "tool_use" && (block as WireToolUseBlock).id === "call_1")).toBe(true);
-		expect(blocks.indexOf(blocks[0] as WireBlock)).toBeLessThan(blocks.findIndex(block => block.type === "tool_use"));
+		// The tool_use that the turn exists for must survive behind the placeholder.
+		expect(blocks.filter(block => block.type === "tool_use")).toHaveLength(1);
+		expect(blocks.findIndex(block => block.type === "tool_use")).toBe(1);
 	});
 
 	it("leads a reasoning-less text-only turn with a non-empty thinking block", async () => {
@@ -229,6 +245,88 @@ describe("DeepSeek thinking-mode replay over anthropic-messages", () => {
 		const blocks = assistantBlocks(await capturePayload(model, unthoughtToolCallHistory(model), false));
 		expect(blocks.some(block => block.type === "thinking")).toBe(false);
 		expect(blocks[0]?.type).toBe("tool_use");
+	});
+
+	it("leaves a signing DeepSeek lane without a placeholder", async () => {
+		// DeepSeek by class, but the lane forwards to signature-enforcing
+		// Anthropic (replayUnsignedThinking: false). An unsigned `{ signature: "" }`
+		// block 400s there ("Invalid signature in thinking"), so nothing may be added.
+		const model = makeSigningDeepseekModel();
+		const blocks = assistantBlocks(await capturePayload(model, unthoughtToolCallHistory(model), true));
+		expect(blocks.some(block => block.type === "thinking")).toBe(false);
+		expect(blocks[0]?.type).toBe("tool_use");
+	});
+
+	it("keeps a signed empty thinking block untouched on a signing DeepSeek lane", async () => {
+		const model = makeSigningDeepseekModel();
+		const payload = await capturePayload(
+			model,
+			[
+				makeUser("go"),
+				toolCallTurn(model, [
+					{ type: "thinking", thinking: "", thinkingSignature: "sig_cloudflare" },
+					{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "x" } },
+				]),
+				toolResult("call_1"),
+				makeUser("next"),
+			],
+			true,
+		);
+		const blocks = assistantBlocks(payload);
+		const thinkingBlocks = blocks.filter(block => block.type === "thinking") as WireThinkingBlock[];
+		expect(thinkingBlocks).toHaveLength(1);
+		expect(thinkingBlocks[0]?.thinking).toBe("");
+		expect(thinkingBlocks[0]?.signature).toBe("sig_cloudflare");
+	});
+
+	it("adds nothing when the caller drops all thinking", () => {
+		// The session latch that learns from a signing 400 sets dropAllThinking;
+		// it must not be re-populated with the DeepSeek placeholder.
+		const model = makeDeepseekModel();
+		const params = convertAnthropicMessages(unthoughtToolCallHistory(model), model, false, {
+			dropAllThinking: true,
+			ensureAssistantThinking: true,
+		});
+		const assistant = params.find(param => param.role === "assistant");
+		const blocks = (assistant?.content ?? []) as WireBlock[];
+		expect(blocks.some(block => block.type === "thinking")).toBe(false);
+		expect(blocks[0]?.type).toBe("tool_use");
+	});
+
+	it("classifies the production lane as DeepSeek", () => {
+		expect(classifyModel("cpa", "ocgo/deepseek-v4.1-flash").class).toBe("deepseek");
+	});
+
+	it("leads every reasoning-less turn of a mixed history", async () => {
+		const model = makeDeepseekModel();
+		const messages: Message[] = [
+			makeUser("go"),
+			makeAssistant(
+				model,
+				[
+					{ type: "thinking", thinking: "first hop plan", thinkingSignature: "" },
+					{ type: "text", text: "First answer." },
+				],
+				"stop",
+			),
+			makeUser("again"),
+			toolCallTurn(model),
+			toolResult("call_1"),
+			makeUser("next"),
+		];
+		const payload = await capturePayload(model, messages, true);
+		const assistantParams = payload.messages.filter(message => message.role === "assistant");
+		expect(assistantParams).toHaveLength(2);
+		const [thoughtTurn, unthoughtTurn] = assistantParams.map(param => param.content as WireBlock[]);
+		const thoughtBlocks = thoughtTurn ?? [];
+		const unthoughtBlocks = unthoughtTurn ?? [];
+		// The first turn already had reasoning: its text is untouched, no placeholder.
+		expect((thoughtBlocks[0] as WireThinkingBlock).thinking).toBe("first hop plan");
+		expect(thoughtBlocks.filter(block => block.type === "thinking")).toHaveLength(1);
+		// The second turn had none: it now leads with the placeholder before its tool_use.
+		expect(unthoughtBlocks[0]?.type).toBe("thinking");
+		expect((unthoughtBlocks[0] as WireThinkingBlock).thinking.length).toBeGreaterThan(0);
+		expect(unthoughtBlocks.findIndex(block => block.type === "tool_use")).toBe(1);
 	});
 
 	it("keeps a Claude request byte-identical", async () => {

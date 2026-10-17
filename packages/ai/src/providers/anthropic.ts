@@ -5495,13 +5495,17 @@ function buildParams(
 	// tool-call turn in four returns no reasoning at all, so those turns reach
 	// the upstream host empty through the compatibility proxies that map
 	// thinking blocks to `reasoning_content`. Gated on the structured model
-	// class, so every other model — official Anthropic above all, whose signed
-	// thinking and signature replay rules must not move — keeps byte-identical
-	// requests.
+	// class and on the lane replaying unsigned thinking: a DeepSeek-class lane
+	// that forwards to signature-enforcing Anthropic (`replayUnsignedThinking:
+	// false`) 400s on an unsigned `{ signature: "" }` placeholder, and a signed
+	// empty thinking block there must stay untouched. Every other model —
+	// official Anthropic above all, whose signed thinking and signature replay
+	// rules must not move — keeps byte-identical requests.
 	const ensureAssistantThinking =
 		!dropAllThinking &&
 		(thinking?.type === "enabled" || thinking?.type === "adaptive") &&
-		classifyModel(effectiveModel.provider, effectiveModel.id).class === "deepseek";
+		effectiveModel.compat.replayUnsignedThinking &&
+		classifyModel(effectiveModel.provider, effectiveModel.id, { lenient: true }).class === "deepseek";
 	const wireMessages = convertAnthropicMessages(
 		insertAnthropicControlMarkers(context.messages, [...toolPlan.inserts, ...effortPlan.inserts]),
 		effectiveModel,
@@ -6125,7 +6129,7 @@ export function convertAnthropicMessages(
 			// turn with the placeholder (dropping any empty-text thinking block
 			// first: an empty one fails the same check). Turns that already carry
 			// reasoning text are untouched, in wire order and in bytes.
-			if (opts?.ensureAssistantThinking) {
+			if (opts?.ensureAssistantThinking && !opts.dropAllThinking) {
 				const hasReasoningText = blocks.some(
 					block => block.type === "thinking" && block.thinking.trim().length > 0,
 				);
