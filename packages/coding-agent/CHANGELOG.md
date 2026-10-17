@@ -439,6 +439,7 @@
 - Added opt-in native-only typed judgments with successful selected-route and cache evidence, without changing existing callers' fallback behavior.
 - Added the session-bound `ctx.judge` extension bridge: a fixed-role, native-only judgment owned by the calling session, with an immutable request, one total deadline, namespaced purpose/request-id correlation, and opaque failure. Distinct from the already-public `/judgment` runner, which composes without session identity.
 - Added `runEphemeralTurn({ isolated: true })` for evidence-only payload rendering: the side turn sends only the supplied frozen prompt under a fixed renderer system block, without the session transcript, system prompt or tool catalog.
+- Added `scripts/autonomic-judgment-smoke.ts`, the authorized actual-host smoke for native extension judgment routing: it validates an operator `SmokeManifest` (exact key set, canonical absolute fixture paths, verified digests and Git source ids) and the seat-mods / Molt / Autonomic factory binding, loads those factories in that order into a discovery-disabled isolated real session, dispatches real `emitToolCall`/`emitSessionStop`, and records sanitized fetch-window and ledger evidence; running it stays gated on the E3–E6 releases and a recorded inference authorization, so an unavailable native bridge reports `blocked`/`failed` rather than a passing "Jev answered".
 
 ## [18.8.9] - 2026-10-10
 

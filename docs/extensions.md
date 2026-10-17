@@ -353,6 +353,31 @@ without a usage journal). Feature-detect it rather than assuming it exists.
   cannot resolve into the successor session; its usage may be dropped, never
   reassigned.
 
+### Native judgment smoke script
+
+`packages/coding-agent/scripts/autonomic-judgment-smoke.ts` is the host-owned smoke
+for the routing above and for the seat-mods / Molt / Autonomic extension trio it
+depends on. It takes `--manifest <absolute-path> --mode smoke|replay`; every other
+shape is refused. The **manifest** is the operator's `SmokeManifest`, declared in
+the script rather than in shared code: an exact key set, canonical absolute fixture
+paths, exact Git source ids, and digests the script verifies against the real bytes
+before use (extensions present and exposing default factories, authority/policy/cases
+matching, authority source outside the fixture cwd). That binding is what it proves
+locally, with no inference and no credentials: a discovery-disabled real session built
+through the public `createAgentSession` with those factories loaded in seat-mods, Molt,
+Autonomic order — observed from the loaded result, not assumed — real `emitToolCall` /
+`emitSessionStop` dispatch, and sanitized evidence (URL pathname, window, invocation id,
+ledger row counts) from a transparent fetch wrapper that delegates `input`/`init`
+unchanged and never reads headers or request bodies.
+
+Running the smoke itself stays **gated**: it needs the E3–E6 host/CSA releases and a
+separately recorded inference authorization, so the live-provider checks — the
+`/decisions` transport, the correlated host-request-ID window, cache-hit evidence and
+any accuracy/latency/cost figure — are marked FUTURE and cannot make a run pass. A
+missing native bridge or generation availability is reported `blocked`/`failed`, never
+a passing "Jev answered" claim, and `knownCost` stays `null` when unobserved rather than
+fabricated as zero.
+
 ### Runtime setting overrides
 
 Settings are addressed through typed registry handles (see "Definitions" in [config-usage.md](./config-usage.md#definitions-srcconfigregistryts)); the string-path `settings.get`/`set`/`override` methods were removed in 18.3. Extensions resolve a handle by id with `lookup(id)` (and enumerate them with `all()`) from the `@oh-my-pi/pi-coding-agent/config/registry` subpath, then pass `pi.pi.settings` as the scope:
