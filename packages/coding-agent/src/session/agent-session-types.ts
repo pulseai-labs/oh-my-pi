@@ -595,8 +595,17 @@ export interface EphemeralTurnOptions {
 	history?: readonly Message[];
 	/** Opaque provider-lineage key for a series of related side turns. Rotate it after cancellation or failure before retrying. */
 	conversationKey?: string;
-	/** Omit tool definitions and request no tool calls. Rejects before inference on transports with mandatory native tools (Cursor). Tool calls are never executed, even when this option is omitted. */
+	/** Omit tool definitions and request no tool calls. Rejects before inference on transports with mandatory native tools (Cursor). Tool calls are never executed, even when this option is omitted. Required `false` when `isolated` is set. */
 	tools?: false;
+	/**
+	 * Render only the supplied frozen prompt into the requested payload schema:
+	 * the session transcript, its system prompt and its tool catalog are replaced
+	 * by a fixed evidence-only context AFTER the ordinary side-context transforms,
+	 * so history hooks cannot reintroduce the transcript. Requires `tools:false`;
+	 * rejects `history` and `conversationKey`. This is evidence-only rendering, not
+	 * isolation from hostile in-process extensions.
+	 */
+	isolated?: true;
 	/** Optional positive safe-integer output-token cap. Transports that omit or overwrite caller output limits reject this option before inference. On budget-thinking models a cap disables optional thinking (models that require it reject the cap). */
 	maxTokens?: number;
 	/** Run at the model's lowest effort where the provider carries the change as a per-message control that keeps the prompt cache (Anthropic per-message effort, OpenAI `configuration_update`) and the session thinks. Elsewhere the session's reasoning applies, since changing request-level reasoning forfeits the cache. */

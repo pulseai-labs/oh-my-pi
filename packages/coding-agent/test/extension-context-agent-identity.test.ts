@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -15,7 +16,9 @@ import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage
 import * as sessionAdvisors from "@oh-my-pi/pi-coding-agent/session/session-advisors";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake } from "@oh-my-pi/pi-utils";
+import * as native from "@oh-my-pi/pi-catalog/models";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { asGlobalFetch } from "./helpers/fetch-mock";
 
 // Extensions need to know which agent they run in: the same factory is rebound to every
 // subagent, and hooks such as a Claude-style SubagentStart must act only there.
@@ -157,5 +160,88 @@ describe("ExtensionContext.agent", () => {
 			{ event: "tool_call", toolCallId: "main-call", agent: main },
 			{ event: "tool_result", toolCallId: "main-call", agent: main },
 		]);
+	});
+
+	// Each extension's judgment is attributed to its OWN path, never to a value the
+	// extension itself supplies. Two explicit extensions run the same handler body;
+	// the derived purpose must differ by owner and match the caller's own identity.
+	test("each extension's ctx.judge is owned by that extension's own path", async () => {
+		const tagged: Array<{ purpose: string }> = [];
+		// Both extensions pass the SAME caller-supplied purpose, so any owner
+		// difference can only come from the host-owned invocation path.
+		const make: ExtensionFactory = pi => {
+			pi.on("before_agent_start", async (_event, ctx) => {
+				if (!ctx.judge) throw new Error("bridge unavailable");
+				try {
+					const result = await ctx.judge(
+						{
+							state: { fixture: "ownership" },
+							questions: { level: { type: "choice", instructions: "Tier?", criteria: { low: "s", high: "c" } } },
+						},
+						{ purpose: "autonomic.permission", nativeOnly: true, timeoutMs: 1000 },
+					);
+					tagged.push({ purpose: result.route.purpose });
+				} catch {
+					// A rejection is still observable as a missing entry.
+				}
+			});
+		};
+		const authStorage = createInMemoryAuthStorage();
+		authStorages.push(authStorage);
+		authStorage.keys.setRuntime("openrouter", "fixture-decisions-key");
+		const registry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		spyOn(registry, "getAvailable").mockReturnValue([
+			native.getBundledModel("anthropic", "claude-sonnet-4-6")!,
+			native.getBundledModel("openrouter", "~typesafe/jev-latest")!,
+		]);
+		spyOn(globalThis, "fetch").mockImplementation(
+			asGlobalFetch(async () =>
+				Response.json({
+					model: "fixture-response",
+					answers: {
+						level: { type: "choice", choice: "high", probabilities: { low: 0, high: 1 }, confidence: 1 },
+					},
+					usage: { input_tokens: 1, output_tokens: 1 },
+				}),
+			),
+		);
+		const { initializeExtensions } = await import("@oh-my-pi/pi-coding-agent/modes/runtime-init");
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			modelRegistry: registry,
+			model: native.getBundledModel("anthropic", "claude-sonnet-4-6"),
+			settings: Settings.isolated({ modelRoles: { judge: "openrouter/~typesafe/jev-latest" } }),
+			sessionManager: SessionManager.inMemory(),
+			disableExtensionDiscovery: true,
+			extensions: [make, make],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			rules: [],
+			preloadedCustomToolPaths: [],
+			toolNames: ["read"],
+		});
+		try {
+			await initializeExtensions(session, { reportSendError: () => {}, reportRuntimeError: () => {} });
+			await session.extensionRunner!.emitBeforeAgentStart("fixture", undefined, []);
+			expect(tagged).toHaveLength(2);
+			const [ownerOne, ownerTwo] = tagged.map(entry => entry.purpose.split(":")[1]!);
+			// Same caller purpose, different host-owned owners.
+			expect(ownerOne).toMatch(/^[0-9a-f]{64}$/);
+			expect(ownerTwo).toMatch(/^[0-9a-f]{64}$/);
+			expect(ownerOne).not.toBe(ownerTwo);
+			// The owner is the extension path hash, never the caller's purpose string.
+			const purposeHash = createHash("sha256").update("autonomic.permission").digest("hex");
+			expect(ownerOne).not.toBe(purposeHash);
+			expect(ownerTwo).not.toBe(purposeHash);
+		} finally {
+			await session.dispose();
+		}
 	});
 });

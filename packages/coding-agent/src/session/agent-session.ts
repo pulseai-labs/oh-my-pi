@@ -60,12 +60,14 @@ import type {
 	Context,
 	ImageContent,
 	Judge,
+	JudgmentRequest,
 	Message,
 	MessageAttribution,
 	Model,
 	OAuthAccountIdentity,
 	ProviderResponseMetadata,
 	ProviderSessionState,
+	Questions,
 	ResetCreditAccountStatus,
 	ResetCreditRedeemOutcome,
 	ResetCreditTarget,
@@ -172,6 +174,12 @@ import type { GoalModeState, GoalTokenUsage } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
 import { type ChainJudge, hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
+import {
+	type ExtensionJudgeAction,
+	type ExtensionJudgment,
+	type ExtensionJudgmentOptions,
+	runExtensionJudgment,
+} from "./extension-judgment";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
@@ -473,6 +481,16 @@ const SESSION_STOP_CONTINUATION_CAP = 8;
 const DEFERRED_TITLE_MIN_WORDS = 40;
 /** Cap on the forked title request itself (measured p90 2.3s). */
 const TITLE_FORK_TIMEOUT_MS = 15_000;
+/**
+ * Fixed system prompt for `runEphemeralTurn` evidence-only rendering. It is a
+ * static renderer instruction — not a classification or approval surface — and
+ * replaces the session's own system prompt so no session-derived directive can
+ * leak into an isolated payload.
+ */
+const ISOLATED_RENDER_SYSTEM = [
+	"Render only the supplied frozen evidence into the requested payload schema.",
+	"Do not classify again, invent instructions or approvals, call tools, or request secret values.",
+];
 
 /** The public summary of `job` (see {@link AsyncJobSnapshotItem}). */
 function jobSnapshotItem(job: AsyncJob): AsyncJobSnapshotItem {
@@ -1168,6 +1186,15 @@ export class AgentSession implements SettingsScope {
 	#sessionStopContinuationCount = 0;
 	#sessionStopHookActive = false;
 	#obfuscator: SecretObfuscator | undefined;
+	/**
+	 * Judgment generation for the extension bridge. Bumped at the first entry
+	 * into a session/transcript transition, at abort, and at disposal, with
+	 * {@link #judgmentAbort} aborted in the same synchronous step — before any
+	 * cleanup await — so a judgment started against the old identity can never
+	 * resolve into a successor session's context.
+	 */
+	#judgmentEpoch = 0;
+	#judgmentAbort = new AbortController();
 	/** Last `skillful` value applied to this session; dedupes {@link setSkillful} and its setting watch. */
 	#skillfulApplied = false;
 	#checkpointState: CheckpointState | undefined = undefined;
@@ -3215,6 +3242,54 @@ export class AgentSession implements SettingsScope {
 			durationMs,
 			epoch,
 		});
+	}
+
+	/**
+	 * Session-bound native judgment for an extension handler. `extensionPath` is
+	 * the owning extension's host path, supplied by the runner's live invocation
+	 * scope — never by the extension itself. The session supplies its own
+	 * settings, registry, identity, cache and accounting, so the judgment cannot
+	 * be routed to or billed against another session.
+	 *
+	 * In-flight judgments are retired at the first entry into any session or
+	 * transcript transition, at abort, and at disposal. A judgment whose
+	 * session/epoch/transition state no longer matches is surfaced as an opaque
+	 * failure; its provider usage may still land on the originating session
+	 * under the existing journal rule (dropped, never reassigned).
+	 */
+	async judgeForExtension<Q extends Questions>(
+		extensionPath: string,
+		request: JudgmentRequest<Q>,
+		options: ExtensionJudgmentOptions,
+	): Promise<ExtensionJudgment<Q>> {
+		const onUsage = journalJudgmentUsage(this.sessionManager);
+		if (!onUsage) throw new Error("judgment unavailable: session has no usage journal");
+		const originSessionId = this.sessionId;
+		const epoch = this.#judgmentEpoch;
+		const signal = this.#judgmentAbort.signal;
+		return await runExtensionJudgment(
+			{
+				settings: this.settings,
+				registry: this.#modelRegistry,
+				sessionId: originSessionId,
+				metadataResolver: provider => this.agent.metadataForProvider(provider),
+				purpose: options.purpose,
+				onUsage,
+				telemetry: this.agent.telemetry,
+				cache: sharedJudgmentCache(),
+			},
+			request,
+			options,
+			{
+				signal,
+				current: () =>
+					!this.#isDisposed &&
+					!this.isSessionTransitioning &&
+					this.#judgmentEpoch === epoch &&
+					this.sessionId === originSessionId,
+			},
+			extensionPath,
+		);
 	}
 
 	/**
@@ -5467,8 +5542,20 @@ export class AgentSession implements SettingsScope {
 			const settled = Promise.withResolvers<void>();
 			this.#sessionTransitionSettled = settled.promise;
 			this.#resolveSessionTransition = settled.resolve;
+			// Invalidate in-flight extension judgments BEFORE any transition await: a
+			// judgment started against the outgoing identity must not resolve into the
+			// successor session's context. Compact/reset/branch/tree/reload/switch/fork
+			// all enter here even when the session id itself does not change.
+			this.#invalidateJudgments();
 		}
 		return this.#sessionTransitionScope;
+	}
+
+	/** Retire every in-flight extension judgment and start a fresh generation for later calls. */
+	#invalidateJudgments(): void {
+		this.#judgmentEpoch += 1;
+		this.#judgmentAbort.abort(new Error("session changed during judgment"));
+		this.#judgmentAbort = new AbortController();
 	}
 
 	/** Register cleanup that runs when this AgentSession adopts a different session ID. */
@@ -5659,6 +5746,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.#invalidateJudgments();
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#modelDiscoveryAbortController.abort();
 		this.#queuedMessageDrainBlocked = false;
@@ -8423,6 +8511,9 @@ export class AgentSession implements SettingsScope {
 			// The SDK always builds a runner (which receives the annotations factory); this runner-less
 			// context only exists for directly constructed sessions, which have no `/annotate` wiring.
 			annotations: UNAVAILABLE_ANNOTATIONS,
+			// A session with no extension runner has no live invocation scope to own a
+			// judgment, so the bridge is explicitly unavailable rather than routed globally.
+			judge: undefined,
 			setInterval: (callback, ms, ...args) => this.#fallbackTimers().setInterval(callback, ms, ...args),
 			setTimeout: (callback, ms, ...args) => this.#fallbackTimers().setTimeout(callback, ms, ...args),
 			clearTimer: timer => this.#fallbackTimers().clear(timer),
@@ -9957,6 +10048,9 @@ export class AgentSession implements SettingsScope {
 		// the post-abort stranded-message drain can't auto-resume the run on them.
 		// They are re-recorded as visible advice once the agent settles (below).
 		const strandedAdvisorCards = userInterrupt ? this.#extractQueuedAdvisorCards() : [];
+		// Retire in-flight extension judgments before the first abort await, matching
+		// the plan's abort invalidation point (manual /compact aborts through here).
+		this.#invalidateJudgments();
 		// Session switch/compact paths disconnect first; explicit aborts should
 		// leave any queued steer/follow-up visible for the user rather than
 		// auto-starting a fresh turn during cleanup.
@@ -11426,8 +11520,19 @@ export class AgentSession implements SettingsScope {
 		}
 		assertEphemeralTurnReady();
 		const cacheSessionId = this.sessionId;
-		const snapshot = this.#buildEphemeralSnapshot(args.promptText, args.history);
-		const llmMessages = await this.convertMessagesToLlm(snapshot, args.signal);
+		if (args.isolated === true) {
+			if (args.tools !== false) {
+				throw new Error("isolated ephemeral rendering requires tools:false.");
+			}
+			if (args.history !== undefined || args.conversationKey !== undefined) {
+				throw new Error("isolated ephemeral rendering rejects history and conversationKey.");
+			}
+		}
+		const snapshot = args.isolated === true ? undefined : this.#buildEphemeralSnapshot(args.promptText, args.history);
+		const llmMessages: Message[] =
+			snapshot === undefined
+				? [{ role: "user", content: [{ type: "text", text: args.promptText }], timestamp: Date.now() }]
+				: await this.convertMessagesToLlm(snapshot, args.signal);
 		assertEphemeralTurnReady();
 		const sideContext = await this.agent.buildSideRequestContext(llmMessages);
 		const toolHistory = sideContext.messages.some(
@@ -11442,10 +11547,22 @@ export class AgentSession implements SettingsScope {
 				`Model ${modelDescription} cannot support tools: false with historical tool calls. Omit tools: false or start from tool-free history.`,
 			);
 		}
+		// Isolated rendering replaces the session-derived system prompt, messages and
+		// tools with a frozen evidence-only context AFTER the ordinary transforms, so
+		// no side-context hook or history transform can reintroduce the transcript.
+		const renderedContext =
+			args.isolated === true
+				? {
+						...sideContext,
+						systemPrompt: [...ISOLATED_RENDER_SYSTEM],
+						messages: sideContext.messages,
+						tools: [],
+					}
+				: sideContext;
 		// Apply after context transforms, without mutating a potentially shared context.
 		const context = obfuscateProviderContext(
 			this.#obfuscator,
-			args.tools === false ? { ...sideContext, tools: [] } : sideContext,
+			args.tools === false ? { ...renderedContext, tools: [] } : renderedContext,
 		);
 		if (
 			args.maxContextBytes !== undefined &&

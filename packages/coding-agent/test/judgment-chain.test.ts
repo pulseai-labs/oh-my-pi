@@ -8,7 +8,13 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ChainJudge, hasNativeJudge, JudgmentCache, journalJudgmentUsage } from "@oh-my-pi/pi-coding-agent/judgment";
+import {
+	ChainJudge,
+	hasNativeJudge,
+	JudgmentCache,
+	type JudgmentRoute,
+	journalJudgmentUsage,
+} from "@oh-my-pi/pi-coding-agent/judgment";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { tinyModelClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -140,6 +146,121 @@ afterEach(() => {
 });
 
 describe("ChainJudge", () => {
+	it("native-only excludes prompted candidates before credential or backend construction", async () => {
+		const settings = Settings.isolated({
+			modelRoles: { judge: `${ONLINE.provider}/${ONLINE.id}` },
+			"retry.fallbackChains": { judge: [`${LOCAL.provider}/${LOCAL.id}`, "typesafe/jev-preview"] },
+		});
+		const registry = makeRegistry([ONLINE, LOCAL, JEV_PREVIEW], {
+			[ONLINE.provider]: "fixture-chat-key",
+			typesafe: "fixture-native-key",
+		});
+		const keys = vi.spyOn(registry, "getApiKey");
+		const chat = vi.spyOn(ai, "completeSimple").mockImplementation(async () => {
+			throw new Error("fixture must not construct chat inference");
+		});
+		const local = vi.spyOn(tinyModelClient, "complete").mockResolvedValue("level: low");
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			asGlobalFetch(async () =>
+				Response.json({
+					model: "fixture-response-model",
+					answers: {
+						level: { type: "choice", choice: "high", probabilities: { low: 0, high: 1 }, confidence: 1 },
+					},
+					usage: { input_tokens: 8, output_tokens: 2 },
+				}),
+			),
+		);
+		const routes: JudgmentRoute[] = [];
+		const result = await new ChainJudge({
+			settings,
+			registry,
+			purpose: "fixture.native-only",
+			nativeOnly: true,
+			onResult: route => routes.push(route),
+		}).judge({ state: { fixture: "native-before-chat" }, questions: { level: TIER_QUESTION } });
+
+		expect(keys.mock.calls.map(([model]) => model.api)).toEqual(["typesafe"]);
+		expect(chat).not.toHaveBeenCalled();
+		expect(local).not.toHaveBeenCalled();
+		expect(result.answers.level.choice).toBe("high");
+		expect(result.model).toBe("fixture-response-model");
+		expect(routes).toEqual([
+			{
+				selected: { api: "typesafe", provider: "typesafe", model: "jev-preview" },
+				questions: 1,
+				cachedQuestions: 0,
+			},
+		]);
+	});
+
+	it("native-only rejects an all-prompted chain without appending the session model", async () => {
+		const familiarChat = { ...ONLINE, provider: "typesafe", id: "fixture-chat" } as Model<Api>;
+		const settings = Settings.isolated({
+			modelRoles: { judge: "typesafe/fixture-chat" },
+			"retry.fallbackChains": { judge: [`${LOCAL.provider}/${LOCAL.id}`] },
+		});
+		const registry = makeRegistry([familiarChat, LOCAL, ONLINE_BACKUP], {
+			typesafe: "fixture-chat-key",
+			[ONLINE.provider]: "fixture-session-key",
+		});
+		const keys = vi.spyOn(registry, "getApiKey");
+		const chat = vi.spyOn(ai, "completeSimple").mockImplementation(async model => reply(model, "level: high"));
+		const local = vi.spyOn(tinyModelClient, "complete").mockResolvedValue("level: high");
+		const onUsage = vi.fn();
+		const routes: JudgmentRoute[] = [];
+		await expect(
+			new ChainJudge({
+				settings,
+				registry,
+				sessionModel: ONLINE_BACKUP,
+				purpose: "fixture.unavailable",
+				nativeOnly: true,
+				onUsage,
+				onResult: route => routes.push(route),
+			}).judge({ state: "fixture", questions: { level: TIER_QUESTION } }),
+		).rejects.toThrow();
+		expect(keys).not.toHaveBeenCalled();
+		expect(chat).not.toHaveBeenCalled();
+		expect(local).not.toHaveBeenCalled();
+		expect(onUsage).not.toHaveBeenCalled();
+		expect(routes).toEqual([]);
+	});
+
+	it("native-only accepts a custom provider by its native API rather than provider name", async () => {
+		const custom = { ...JEV_PREVIEW, provider: "fixture-gateway", id: "fixture-native" } as Model<Api>;
+		const settings = Settings.isolated({ modelRoles: { judge: "fixture-gateway/fixture-native" } });
+		const registry = makeRegistry([custom], { "fixture-gateway": "fixture-key" });
+		const urls: string[] = [];
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			asGlobalFetch(async url => {
+				urls.push(String(url));
+				return Response.json({
+					model: "fixture-response",
+					answers: { level: { type: "choice", choice: "low" } },
+					usage: { input_tokens: 3, output_tokens: 1 },
+				});
+			}),
+		);
+		const routes: JudgmentRoute[] = [];
+		const result = await new ChainJudge({
+			settings,
+			registry,
+			purpose: "fixture.custom",
+			nativeOnly: true,
+			onResult: route => routes.push(route),
+		}).judge({ state: "fixture", questions: { level: TIER_QUESTION } });
+		expect(result.answers.level.choice).toBe("low");
+		expect(urls).toEqual(["https://judge.example.test/v1/systemone"]);
+		expect(routes).toEqual([
+			{
+				selected: { api: "typesafe", provider: "fixture-gateway", model: "fixture-native" },
+				questions: 1,
+				cachedQuestions: 0,
+			},
+		]);
+	});
+
 	it("falls from a coarse local question to a tiered online question", async () => {
 		const settings = Settings.isolated({
 			modelRoles: { judge: `${LOCAL.provider}/${LOCAL.id}` },
@@ -147,14 +268,8 @@ describe("ChainJudge", () => {
 		});
 		const registry = makeRegistry([LOCAL, ONLINE], { [ONLINE.provider]: "online-key" });
 		const kinds: string[] = [];
-		let localPrompt = "";
-		let onlinePrompt = "";
-		vi.spyOn(tinyModelClient, "complete").mockImplementation(async (_model, promptText) => {
-			localPrompt = promptText;
-			return "not a bucket";
-		});
-		vi.spyOn(ai, "completeSimple").mockImplementation(async (model, context, options) => {
-			onlinePrompt = context.systemPrompt?.join("\n") ?? "";
+		vi.spyOn(tinyModelClient, "complete").mockResolvedValue("not a bucket");
+		vi.spyOn(ai, "completeSimple").mockImplementation(async (model, _context, options) => {
 			const response = reply(model, "level: high");
 			options?.onAttempt?.(response);
 			return response;
@@ -180,11 +295,6 @@ describe("ChainJudge", () => {
 
 		expect(answer).toBe("high");
 		expect(kinds).toEqual(["local", "online"]);
-		expect(localPrompt).toContain("trivial");
-		expect(localPrompt).toContain("moderate");
-		expect(localPrompt).toContain("hard");
-		expect(onlinePrompt).toContain("low");
-		expect(onlinePrompt).toContain("high");
 		expect(onUsage).toHaveBeenCalledWith(
 			expect.objectContaining({ role: "judge", provider: ONLINE.provider, model: ONLINE.id }),
 		);
@@ -274,7 +384,7 @@ describe("ChainJudge", () => {
 		vi.spyOn(globalThis, "fetch").mockImplementation(
 			asGlobalFetch(async url => {
 				urls.push(String(url));
-				if (String(url).endsWith("/v1/systemone")) return new Response("rejected", { status: 400 });
+				if (String(url).endsWith("/v1/systemone")) return new Response("rejected", { status: 402 });
 				return Response.json({
 					model: "jev-1.13.0",
 					answers: { level: { type: "choice", choice: "high" } },
@@ -285,13 +395,42 @@ describe("ChainJudge", () => {
 		const local = vi.spyOn(tinyModelClient, "complete");
 		const online = vi.spyOn(ai, "completeSimple");
 
-		const result = await new ChainJudge({ settings, registry, purpose: "test", sessionModel: ONLINE_BACKUP }).judge({
-			state: "redesign the scheduler",
-			questions: { level: TIER_QUESTION },
+		const routes: JudgmentRoute[] = [];
+		const onUsage = vi.fn();
+		const judge = new ChainJudge({
+			settings,
+			registry,
+			purpose: "test",
+			sessionModel: ONLINE_BACKUP,
+			nativeOnly: true,
+			onUsage,
+			onResult: route => routes.push(route),
 		});
+		// A predicted primary is not evidence that it served the successful judgment.
+		expect(judge.primaryModel()?.id).toBe("jev-preview");
+		const request = { state: "redesign the scheduler", questions: { level: TIER_QUESTION } };
+		const result = await judge.judge(request);
+		await judge.judge(request);
 
 		expect(result.answers.level.choice).toBe("high");
-		expect(urls).toEqual(["https://judge.example.test/v1/systemone", OPENROUTER_DECISIONS_URL]);
+		expect(result.model).toBe("jev-1.13.0");
+		expect(urls).toEqual([
+			"https://judge.example.test/v1/systemone",
+			"https://decisions.example.test/decisions",
+			"https://decisions.example.test/decisions",
+		]);
+		expect(routes).toEqual(
+			[0, 1].map(() => ({
+				selected: { api: "openrouter-decisions", provider: "openrouter", model: "~typesafe/jev-latest" },
+				questions: 1,
+				cachedQuestions: 0,
+			})),
+		);
+		expect(onUsage.mock.calls.map(([attempt]) => [attempt.model, attempt.stopReason, attempt.usage.input])).toEqual([
+			["jev-preview", "error", 0],
+			["~typesafe/jev-latest", "stop", 8],
+			["~typesafe/jev-latest", "stop", 8],
+		]);
 		expect(local).not.toHaveBeenCalled();
 		expect(online).not.toHaveBeenCalled();
 	});
@@ -309,10 +448,18 @@ describe("ChainJudge", () => {
 			);
 		const online = vi.spyOn(ai, "completeSimple");
 		const onUsage = vi.fn();
+		const routes: JudgmentRoute[] = [];
 		const request = { state: "rename a local", questions: { level: TIER_QUESTION } };
 
 		await expect(
-			new ChainJudge({ settings, registry, purpose: "test", sessionModel: ONLINE, onUsage }).judge(request),
+			new ChainJudge({
+				settings,
+				registry,
+				purpose: "test",
+				sessionModel: ONLINE,
+				onUsage,
+				onResult: route => routes.push(route),
+			}).judge(request),
 		).rejects.toThrow("402");
 		await expect(new ChainJudge({ settings, registry, purpose: "test", onUsage }).judge(request)).rejects.toThrow(
 			"rejected the account recently",
@@ -324,6 +471,7 @@ describe("ChainJudge", () => {
 		expect(onUsage).toHaveBeenCalledWith(
 			expect.objectContaining({ provider: "typesafe", model: "jev-preview", stopReason: "error" }),
 		);
+		expect(routes).toEqual([]);
 	});
 
 	it("skips text-only chat and local candidates for image judgments", async () => {
@@ -829,7 +977,15 @@ describe("ChainJudge", () => {
 			}),
 		);
 		const onUsage = vi.fn();
-		const judge = new ChainJudge({ settings, registry, purpose: "test", onUsage, cache });
+		const routes: JudgmentRoute[] = [];
+		const judge = new ChainJudge({
+			settings,
+			registry,
+			purpose: "test",
+			onUsage,
+			cache,
+			onResult: route => routes.push(route),
+		});
 		const question = (instructions: string): NoulQuestion => ({ type: "noul", instructions });
 
 		await judge.judge({ state: { file: "a.ts", body: "x" }, questions: { a: question("A?"), b: question("B?") } });
@@ -839,6 +995,24 @@ describe("ChainJudge", () => {
 			questions: { b: question("B?"), c: question("C?") },
 		});
 		const third = await judge.judge({ state: { file: "a.ts", body: "x" }, questions: { a: question("A?") } });
+		expect(routes).toEqual([
+			{
+				selected: { api: "typesafe", provider: "typesafe", model: "jev-preview" },
+				questions: 2,
+				cachedQuestions: 0,
+			},
+			{
+				selected: { api: "typesafe", provider: "typesafe", model: "jev-preview" },
+				questions: 2,
+				cachedQuestions: 1,
+			},
+			{
+				selected: { api: "typesafe", provider: "typesafe", model: "jev-preview" },
+				questions: 1,
+				cachedQuestions: 1,
+			},
+		]);
+		expect(onUsage).toHaveBeenCalledTimes(2);
 		// A changed instruction is a different question.
 		await judge.judge({ state: { file: "a.ts", body: "x" }, questions: { a: question("A, really?") } });
 

@@ -286,6 +286,98 @@ Also exposed:
 - `pi.typebox` (legacy TypeBox-compatible shim)
 - `pi.pi` (package exports)
 
+### Typed judgment runner
+
+The public `@oh-my-pi/pi-coding-agent/judgment` subpath exports `resolveJudge`,
+`ChainJudge`, `JudgeDeps`, `JudgmentRoute`, `JudgmentCache`, and
+`journalJudgmentUsage`. This runner is composed by its owner — it carries no
+session identity of its own — and is what the session-bound bridge below builds
+on.
+
+Runner owners supply their effective settings, model registry, and accounting
+dependencies. Existing callers retain their default local/chat/native chain
+behavior. Opt in with `nativeOnly: true` to filter **every** nonnative candidate
+by API kind before credential lookup or backend construction, including chat
+candidates preceding a native candidate. This mode never appends a session-model
+fallback; when no native candidate is eligible, the judgment rejects. Native
+candidate fallback and account-rejection cooldown remain in effect. Custom
+provider names are supported when their model API is native.
+
+`onResult(route)` observes each successful native wrapper, including cache-only
+results. `route.selected` contains the successful candidate's `api`, `provider`,
+and `model`; the returned `JudgmentResult.model` remains the backend response
+model and can differ. `primaryModel()` is a prediction for pricing, not evidence
+that a candidate served a request. `questions` counts the requested questions;
+`cachedQuestions` counts those answered from cache, distinguishing fresh,
+partial-cache, and full-cache results. Failed wrappers do not emit `onResult`.
+
+This observation callback does not bill usage. Keep session accounting on the
+existing `onUsage`/`journalJudgmentUsage` path exactly once; do not additionally
+bill the returned result. Fully cached calls have no billed usage callback.
+Reports describe wrapper/candidate outcomes, not individual internal HTTP
+retries; a failed wrapper's zero known tokens do not establish zero provider
+cost. Neither a cache hit nor fixture transport proves fresh live inference.
+
+### Session-bound `ctx.judge`
+
+`ctx.judge(request, options)` asks **the calling session** for one native-only
+judgment. It is optional: present only in a host mode that supplies a live
+invocation scope, and `undefined` otherwise (a runner-less embedder, a
+hand-built session, a saved context invoked outside its handler, or a session
+without a usage journal). Feature-detect it rather than assuming it exists.
+
+- **Fixed judge role, native only.** The session's own `judge` role resolves the
+  candidate; nonnative candidates are filtered before credential lookup or backend
+  construction and no session-model fallback is appended. `nativeOnly: true` is
+  required — the host rejects anything else.
+- **Immutable request.** `request.state` and `request.questions` are captured as
+  JSON before any provider work: not JSON (undefined, symbol, bigint, function,
+  non-finite number, sparse array, accessor, non-plain prototype, hidden or symbol
+  key, cycle) rejects immediately, and `toJSON`/getters are never invoked. Mutating
+  the request after the call does not change what was sent.
+- **Namespaced purpose.** Every judgment's purpose is
+  `extension:<owner>:<your purpose>:<request id>`, where `<owner>` is the SHA-256
+  of the owning extension's host path — taken from the live invocation, never from
+  the request or your `purpose` — so usage rows and telemetry spans correlate per
+  invocation without a new schema. `route.requestId` is that id.
+- **Selected vs response model.** `route.selected` is the candidate that actually
+  served the judgment; `judgment.model` remains the backend's response model and
+  can differ. `route.questions`/`route.cachedQuestions` distinguish fresh,
+  partial-cache, and full-cache results. Billing lands on the session's existing
+  usage journal exactly once; the bridge never re-bills the returned result.
+- **One total deadline.** `options.timeoutMs` is the whole budget from call entry,
+  combined with your `options.signal` and the live handler/tool cancellation. On
+  timeout, cancel, session switch/abort/disposal, or a non-native-looking result
+  the call rejects with an opaque `extension judgment <requestId>: unavailable or
+  cancelled` — never provider text, headers or state. A late provider completion
+  cannot resolve into the successor session; its usage may be dropped, never
+  reassigned.
+
+### Native judgment smoke script
+
+`packages/coding-agent/scripts/autonomic-judgment-smoke.ts` is the host-owned smoke
+for the routing above and for the seat-mods / Molt / Autonomic extension trio it
+depends on. It takes `--manifest <absolute-path> --mode smoke|replay`; every other
+shape is refused. The **manifest** is the operator's `SmokeManifest`, declared in
+the script rather than in shared code: an exact key set, canonical absolute fixture
+paths, exact Git source ids, and digests the script verifies against the real bytes
+before use (extensions present and exposing default factories, authority/policy/cases
+matching, authority source outside the fixture cwd). That binding is what it proves
+locally, with no inference and no credentials: a discovery-disabled real session built
+through the public `createAgentSession` with those factories loaded in seat-mods, Molt,
+Autonomic order — observed from the loaded result, not assumed — real `emitToolCall` /
+`emitSessionStop` dispatch, and sanitized evidence (URL pathname, window, invocation id,
+ledger row counts) from a transparent fetch wrapper that delegates `input`/`init`
+unchanged and never reads headers or request bodies.
+
+Running the smoke itself stays **gated**: it needs the E3–E6 host/CSA releases and a
+separately recorded inference authorization, so the live-provider checks — the
+`/decisions` transport, the correlated host-request-ID window, cache-hit evidence and
+any accuracy/latency/cost figure — are marked FUTURE and cannot make a run pass. A
+missing native bridge or generation availability is reported `blocked`/`failed`, never
+a passing "Jev answered" claim, and `knownCost` stays `null` when unobserved rather than
+fabricated as zero.
+
 ### Runtime setting overrides
 
 Settings are addressed through typed registry handles (see "Definitions" in [config-usage.md](./config-usage.md#definitions-srcconfigregistryts)); the string-path `settings.get`/`set`/`override` methods were removed in 18.3. Extensions resolve a handle by id with `lookup(id)` (and enumerate them with `all()`) from the `@oh-my-pi/pi-coding-agent/config/registry` subpath, then pass `pi.pi.settings` as the scope:
@@ -394,6 +486,8 @@ Hooks may start a side turn, including from delayed callbacks. Only `context`, `
 Tool calls are always discarded rather than executed. Pass `tools: false` to remove tool definitions after context transforms and set `toolChoice: "none"` at the provider boundary. Omitting it preserves `/btw`'s tool catalog for prompt-cache reuse; disabling it may reduce cache hits. Bedrock Converse rejects tool opt-out if the transformed history still contains tool calls or results. Existing context/provider hooks still run. It is not a sandbox or a guarantee that arbitrary extension hooks have no side effects. Model inference consumes the configured provider's resources. `dedupeReply` defaults to `true`, collapses runs of more than three identical lines, and caps the returned reply at 4 KiB. Set it to `false` to disable those transformations; `replyText` is still trimmed. Callers should use `replyText` for the final result.
 
 Use `history` only for detached prior side-turn messages; it is cloned with `structuredClone`, so pass cloneable message data. A `conversationKey` keeps related side turns on one provider lineage. Rotate it after cancellation or failure before retrying. A side turn also rejects with a retryable error if its session or exact model instance changes before dispatch; callers should retry from a new current-context snapshot rather than reuse the old one.
+
+Pass `isolated: true` (together with `tools: false`) for **evidence-only rendering**: the request carries only the frozen `promptText` you supply, under a fixed renderer system block, with no session transcript, session system prompt or tool catalog. It is the payload-rendering counterpart of `ctx.judge` — the host states the facts once and the model renders them into the requested schema. It requires `tools: false` and rejects `history` and `conversationKey`; `maxContextBytes` is still checked on the final isolated context. The substitution happens after the ordinary side-context transforms, so no `context`/`before_provider_request` hook can silently reintroduce the transcript. This is evidence-only rendering, not isolation from hostile in-process extensions, and the session's model, credential, streaming and cancellation still apply. Default `/btw`, `/omfg`, Molt generation and every other side turn are unchanged when `isolated` is omitted.
 
 ### Background work (`ctx.setInterval` / `ctx.setTimeout`)
 

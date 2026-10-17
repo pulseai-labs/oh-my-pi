@@ -257,6 +257,8 @@ export class ExtensionUiController {
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
+			judge: (extensionPath, request, options) =>
+				this.ctx.session.judgeForExtension(extensionPath, request, options),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -488,6 +490,8 @@ export class ExtensionUiController {
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
+			judge: (extensionPath, request, options) =>
+				this.ctx.session.judgeForExtension(extensionPath, request, options),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),

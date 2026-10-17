@@ -71,6 +71,8 @@ import type {
 	ExtensionError,
 	ExtensionEvent,
 	ExtensionFlag,
+	ExtensionJudge,
+	ExtensionJudgeAction,
 	ExtensionMode,
 	ExtensionRuntime,
 	ExtensionShortcut,
@@ -492,6 +494,8 @@ interface ToolRegistrationScope {
 	pending: Set<Promise<void>>;
 	signal?: AbortSignal;
 	closed: boolean;
+	/** Host-owned extension path of the invocation that owns this scope. */
+	extensionPath?: string;
 }
 
 /** Identity reported by a session that is not a subagent and received no explicit identity. */
@@ -525,6 +529,7 @@ export class ExtensionRunner {
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
 	#runEphemeralTurnFn?: ExtensionContextActions["runEphemeralTurn"];
+	#judgeFn?: ExtensionContextActions["judge"];
 	#ephemeralTurnBlocker = new AsyncLocalStorage<string | undefined>();
 	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
@@ -841,6 +846,7 @@ export class ExtensionRunner {
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
 		this.#runEphemeralTurnFn = contextActions.runEphemeralTurn;
+		this.#judgeFn = contextActions.judge;
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -1303,10 +1309,23 @@ export class ExtensionRunner {
 						existingExtensionPath: existing.extensionPath,
 					});
 				}
-				allShortcuts.set(normalizedKey, shortcut);
+				allShortcuts.set(normalizedKey, this.#ownShortcut(shortcut));
 			}
 		}
 		return allShortcuts;
+	}
+
+	/**
+	 * Wrap an extension shortcut in its owner invocation scope, mirroring
+	 * {@link #ownCommand}: the callback runs unchanged, with its `ctx.judge`
+	 * attributed to the shortcut's own extension.
+	 */
+	#ownShortcut(shortcut: ExtensionShortcut): ExtensionShortcut {
+		const runner = this;
+		return {
+			...shortcut,
+			handler: ctx => runner.#runInOwnerScope(shortcut.extensionPath, () => shortcut.handler(ctx)),
+		};
 	}
 
 	onError(listener: ExtensionErrorListener): () => void {
@@ -1359,10 +1378,24 @@ export class ExtensionRunner {
 					continue;
 				}
 
-				commands.set(command.name, command);
+				commands.set(command.name, this.#ownCommand(ext.path, command));
 			}
 		}
 		return [...commands.values()];
+	}
+
+	/**
+	 * Wrap an extension-owned command handler in its owner invocation scope, so
+	 * its `ExtensionCommandContext.judge` is attributed to that extension and
+	 * never to a caller-supplied purpose. The handler still receives the exact
+	 * command args and context the caller passed.
+	 */
+	#ownCommand(extensionPath: string, command: RegisteredCommand): RegisteredCommand {
+		const runner = this;
+		return {
+			...command,
+			handler: (args, ctx) => runner.#runInOwnerScope(extensionPath, () => command.handler(args, ctx)),
+		};
 	}
 
 	getCommandDiagnostics(): Array<{ type: string; message: string; path: string }> {
@@ -1371,9 +1404,10 @@ export class ExtensionRunner {
 
 	getCommand(name: string): RegisteredCommand | undefined {
 		for (let index = this.extensions.length - 1; index >= 0; index -= 1) {
-			const command = this.extensions[index]?.commands.get(name);
-			if (command) {
-				return command;
+			const extension = this.extensions[index];
+			const command = extension?.commands.get(name);
+			if (command && extension) {
+				return this.#ownCommand(extension.path, command);
 			}
 		}
 		return undefined;
@@ -1388,6 +1422,58 @@ export class ExtensionRunner {
 	 */
 	runScoped<T>(fn: () => T): T {
 		return withActiveSettings(this.settings, fn);
+	}
+
+	/**
+	 * Run one extension-owned command or shortcut callback inside a fresh
+	 * invocation scope carrying that owner's extension path, so `ctx.judge`
+	 * cannot inherit an owner from a caller-supplied purpose. The scope's signal
+	 * is the ordinary handler budget; a long-running callback is bounded exactly
+	 * like an event handler.
+	 */
+	#runInOwnerScope<T>(extensionPath: string, fn: () => T): T {
+		const scope: ToolRegistrationScope = {
+			pending: new Set(),
+			closed: false,
+			extensionPath,
+			signal: AbortSignal.timeout(extensionHandlerTimeoutMs),
+		};
+		return this.#toolRegistrationScope.run(scope, fn);
+	}
+
+	/**
+	 * The owner-bound `ctx.judge` for one context. The extension path and live
+	 * cancellation signal are read from the invocation scope **at call time**,
+	 * so a context captured by an extension and reused later cannot borrow a
+	 * completed handler's owner or a stale signal. Outside a live, open scope
+	 * (a saved context, a runner-less embedder, a post-invocation callback) this
+	 * is `undefined` — visible unavailability rather than a judgment attributed
+	 * to the wrong extension.
+	 */
+	#createJudgeAccessor(delegationSignal: AbortSignal | undefined): ExtensionJudge | undefined {
+		const judgeFn = this.#judgeFn;
+		if (!judgeFn || !this.#activeExtensionPath()) return undefined;
+		return async (request, options) => {
+			// Re-read at call time: the scope may have closed between read and call.
+			const ownerPath = this.#activeExtensionPath();
+			if (!ownerPath) throw new Error("judgment unavailable outside a live extension invocation");
+			const registrationScope = this.#toolRegistrationScope.getStore();
+			const signals = [
+				options.signal,
+				delegationSignal,
+				registrationScope && !registrationScope.closed ? registrationScope.signal : undefined,
+			].filter((signal): signal is AbortSignal => signal !== undefined);
+			return await judgeFn(ownerPath, request, {
+				...options,
+				signal: signals.length ? AbortSignal.any(signals) : undefined,
+			});
+		};
+	}
+
+	/** Extension path of the current live invocation scope, or undefined outside one. */
+	#activeExtensionPath(): string | undefined {
+		const scope = this.#toolRegistrationScope.getStore();
+		return scope && !scope.closed ? scope.extensionPath : undefined;
 	}
 
 	/**
@@ -1412,6 +1498,8 @@ export class ExtensionRunner {
 			context?: AgentToolContext;
 			signal?: AbortSignal;
 			onUpdate?: AgentToolUpdateCallback;
+			/** Host-owned extension path of the tool that owns this context (`ctx.judge` owner). */
+			extensionPath?: string;
 		},
 		agent: ExtensionAgentIdentity = this.agent,
 	): ExtensionContext {
@@ -1420,6 +1508,7 @@ export class ExtensionRunner {
 		const createAnnotations = this.#createAnnotations;
 		const sendUserMessage = (text: string, options?: SendUserMessageOptions): void =>
 			this.runtime.sendUserMessage(text, options);
+		const runner = this;
 		return {
 			ui: this.#uiContext,
 			mode: this.#mode,
@@ -1471,6 +1560,9 @@ export class ExtensionRunner {
 						return await this.#ephemeralTurnBlocker.run("ephemeral turn", () => runEphemeralTurn(request));
 					}
 				: undefined,
+			get judge() {
+				return runner.#createJudgeAccessor(delegation?.signal);
+			},
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
 			// A getter, not a value: `createHandlerContext` scopes a handler via `Object.create(ctx)`, and
@@ -1569,7 +1661,7 @@ export class ExtensionRunner {
 		const signals = [outerSignal, sessionStopSignal].filter((s): s is AbortSignal => s !== undefined);
 		const signal = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 		if (signal?.aborted) return undefined;
-		const registrationScope: ToolRegistrationScope = { pending: new Set(), closed: false };
+		const registrationScope: ToolRegistrationScope = { pending: new Set(), closed: false, extensionPath: ext.path };
 		let handlerResult: R | typeof EXTENSION_HANDLER_TIMEOUT | typeof EXTENSION_HANDLER_ABORTED | undefined;
 		let handlerFailure: { error: unknown } | undefined;
 		try {

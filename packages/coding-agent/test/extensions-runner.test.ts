@@ -15,7 +15,11 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import {
+	ExtensionRuntime,
+	loadExtensionFromFactory,
+	loadExtensions,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
@@ -33,6 +37,7 @@ import type {
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -4686,5 +4691,38 @@ describe("ExtensionRunner", () => {
 			});
 			expect(cachedTexts).toEqual(["persisted user", "persisted assistant"]);
 		});
+	});
+
+	it("runs an extension command handler unchanged inside its owner invocation scope", async () => {
+		// The command/shortcut return boundary binds the owning extension path so
+		// `ctx.judge` cannot be claimed by a caller-supplied purpose; the handler
+		// itself must still receive the exact args and context it was given.
+		const runtime = new ExtensionRuntime();
+		const seenArgs: string[] = [];
+		let sawOwner: string | undefined;
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("before_agent_start", (_event, ctx) => {
+					sawOwner = ctx.judge ? "available" : "unavailable";
+				});
+				pi.registerCommand("probe", {
+					handler: async args => {
+						seenArgs.push(args);
+					},
+				});
+			},
+			tempDir.path(),
+			new EventBus(),
+			runtime,
+			"<inline-probe>",
+		);
+		const runner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry);
+		const command = runner.getCommand("probe");
+		expect(command).toBeDefined();
+		await command!.handler("one two", runner.createCommandContext());
+		expect(seenArgs).toEqual(["one two"]);
+		// Outside any live invocation scope `ctx.judge` is a visible absence, not a throwing call.
+		expect(runner.createContext().judge).toBeUndefined();
+		expect(sawOwner).toBeUndefined();
 	});
 });
