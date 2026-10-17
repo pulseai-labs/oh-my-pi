@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as tls from "node:tls";
 import { isAnthropicSigningProxyUrl, isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
+import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import { hostMatchesUrl, isVertexRawPredictUrl } from "@oh-my-pi/pi-catalog/hosts";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { mapEffortToAnthropicAdaptiveEffort } from "@oh-my-pi/pi-catalog/model-thinking";
@@ -5488,6 +5489,19 @@ function buildParams(
 	if (thinking?.type === "between_tools" && (effortPlan.topLevel === "xhigh" || effortPlan.topLevel === "max")) {
 		thinking = undefined;
 	}
+	// DeepSeek's thinking mode rejects the whole request when a replayed
+	// assistant turn carries no `reasoning_content` (400: "The reasoning_content
+	// in the thinking mode must be passed back to the API"). About one short
+	// tool-call turn in four returns no reasoning at all, so those turns reach
+	// the upstream host empty through the compatibility proxies that map
+	// thinking blocks to `reasoning_content`. Gated on the structured model
+	// class, so every other model — official Anthropic above all, whose signed
+	// thinking and signature replay rules must not move — keeps byte-identical
+	// requests.
+	const ensureAssistantThinking =
+		!dropAllThinking &&
+		(thinking?.type === "enabled" || thinking?.type === "adaptive") &&
+		classifyModel(effectiveModel.provider, effectiveModel.id).class === "deepseek";
 	const wireMessages = convertAnthropicMessages(
 		insertAnthropicControlMarkers(context.messages, [...toolPlan.inserts, ...effortPlan.inserts]),
 		effectiveModel,
@@ -5500,6 +5514,7 @@ function buildParams(
 			droppedThinkingBlocks,
 			credentialId: options?.credentialId,
 			compactionRequest,
+			ensureAssistantThinking,
 		},
 	);
 	// Anchor the stable tools+system head so it stays cached across turns; the
@@ -5764,6 +5779,15 @@ function collapseFallbackSegments(content: AssistantMessage["content"]): Assista
 }
 
 /**
+ * One-character reasoning stand-in for DeepSeek thinking-mode history. Upstream
+ * requires `reasoning_content` on every replayed assistant turn; a turn that
+ * came back without reasoning has no `thinking` block to map, and an empty one
+ * fails the same check (measured: empty 6 ok / 4 failed, "." 10/10 on the same
+ * rounds). Any non-empty text satisfies the rule.
+ */
+const DEEPSEEK_REPLAY_THINKING_PLACEHOLDER = ".";
+
+/**
  * Serialize omp {@link Message}s to Anthropic wire messages.
  *
  * `opts.serverSideFallbackEnabled` — when the CURRENT request itself
@@ -5779,6 +5803,11 @@ function collapseFallbackSegments(content: AssistantMessage["content"]): Assista
  * before the compaction block, so the assistant turn carrying it may open
  * the conversation; the request must send the compaction beta (the stream
  * entry point adds it whenever such a payload is present).
+ *
+ * `opts.ensureAssistantThinking` — DeepSeek thinking-mode history only: lead
+ * every replayed assistant turn with a non-empty `thinking` block so the
+ * compatibility proxies that map thinking blocks to `reasoning_content` never
+ * send a turn upstream without it (see {@link DEEPSEEK_REPLAY_THINKING_PLACEHOLDER}).
  */
 export function convertAnthropicMessages(
 	messages: Message[],
@@ -5793,6 +5822,8 @@ export function convertAnthropicMessages(
 		credentialId?: number;
 		/** On-demand compaction request: it ends inside the conversation, so it gets nothing live requests lack there. */
 		compactionRequest?: AnthropicCompactionRequest;
+		/** DeepSeek thinking-mode history: lead every replayed assistant turn with non-empty thinking. */
+		ensureAssistantThinking?: boolean;
 	},
 ): AnthropicMessageParam[] {
 	// Indices of params emitted from agent-owned `developer` messages. After the
@@ -6087,6 +6118,29 @@ export function convertAnthropicMessages(
 				blocks.push(...nonToolUse, ...toolUse);
 			}
 			if (blocks.length === 0) continue;
+			// DeepSeek thinking-mode history: the upstream hosts that enforce the
+			// rule refuse a request whose replayed assistant turn carries no
+			// `reasoning_content`, which a proxy mapping thinking blocks cannot
+			// produce from a turn that came back without reasoning. Lead such a
+			// turn with the placeholder (dropping any empty-text thinking block
+			// first: an empty one fails the same check). Turns that already carry
+			// reasoning text are untouched, in wire order and in bytes.
+			if (opts?.ensureAssistantThinking) {
+				const hasReasoningText = blocks.some(
+					block => block.type === "thinking" && block.thinking.trim().length > 0,
+				);
+				if (!hasReasoningText) {
+					for (let index = blocks.length - 1; index >= 0; index--) {
+						const block = blocks[index]!;
+						if (block.type === "thinking" && block.thinking.trim().length === 0) blocks.splice(index, 1);
+					}
+					blocks.unshift({
+						type: "thinking",
+						thinking: DEEPSEEK_REPLAY_THINKING_PLACEHOLDER,
+						signature: "",
+					});
+				}
+			}
 			const assistantParam: AnthropicMessageParam = {
 				role: "assistant",
 				content: blocks,
